@@ -32,7 +32,7 @@ t.start()
 c = rt.register_collection("hello")
 c.insert("e1", "ABC")
 c.insert("e2", "A" * (7 * 1024 * 1024 + 200000))
-
+print("INSERTED")
 
 c = rt.register_collection("estee")
 graphs = ["crossv", "fastcrossv", "gridcat"]
@@ -40,6 +40,7 @@ models = ["simple", "maxmin"]
 scheduler = ["blevel", "random", {"name": "camp", "iterations": 1000}, {"name": "camp", "iterations": 2000}]
 for g, m, s in itertools.product(graphs, models, scheduler):
     c.insert({"graph": g, "model": m, "scheduler": s}, random.randint(1, 30000))
+print("INSERTED 2")
 
 c = rt.register_collection("collection with space in name")
 

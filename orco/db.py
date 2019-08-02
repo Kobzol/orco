@@ -1,10 +1,33 @@
+import random
 import sqlite3
 import pickle
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
-
+from contextlib import contextmanager
 
 from .entry import Entry
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+
+    try:
+        while True:
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                break
+            except sqlite3.OperationalError:
+                print("LOCKED")
+                time.sleep(random.randint(500, 3000) / 1000.0)
+        yield cursor
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
 
 
 class DB:
@@ -21,9 +44,9 @@ class DB:
 
     def __init__(self, path, threading=True):
         def _helper():
-            self.conn = sqlite3.connect(path)
+            self.conn = sqlite3.connect(path, isolation_level=None)
             self.conn.execute("""
-                PRAGMA foreign_keys = ON
+                PRAGMA foreign_keys = ON;
             """)
         self.path = path
         if threading:
@@ -106,37 +129,37 @@ class DB:
 
     def ensure_collection(self, name):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("INSERT OR IGNORE INTO collections VALUES (?)", [name])
-            self.conn.commit()
+            with transaction(self.conn) as c:
+                c.execute("INSERT OR IGNORE INTO collections VALUES (?)", [name])
         self._run(_helper)
 
     def create_entry(self, collection_name, key, entry):
+        print("Inserting {}/{}".format(collection_name, key))
+
         def _helper():
-            c = self.conn.cursor()
-            c.execute("INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, null)",
-                    [collection_name,
-                     key,
-                     pickle.dumps(entry.config),
-                     pickle.dumps(entry.value),
-                     entry.value_repr,
-                     entry.created])
-            self.conn.commit()
+            with transaction(self.conn) as c:
+                c.execute("INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, null)",
+                        [collection_name,
+                         key,
+                         pickle.dumps(entry.config),
+                         pickle.dumps(entry.value),
+                         entry.value_repr,
+                         entry.created])
         self._run(_helper)
 
     def set_entry_value(self, executor_id, collection_name, key, entry):
+        print("Updating {}/{}".format(collection_name, key))
         def _helper():
-            c = self.conn.cursor()
-            c.execute("UPDATE entries SET value = ?, value_repr = ?, created = ? WHERE collection = ? AND key = ? AND executor = ? AND value is null",
-                    [pickle.dumps(entry.value),
-                     entry.value_repr,
-                     entry.created,
-                     collection_name,
-                     key,
-                     executor_id
-                    ])
-            self.conn.commit()
-            return c.rowcount
+            with transaction(self.conn) as c:
+                c.execute("UPDATE entries SET value = ?, value_repr = ?, created = ? WHERE collection = ? AND key = ? AND executor = ? AND value is null",
+                        [pickle.dumps(entry.value),
+                         entry.value_repr,
+                         entry.created,
+                         collection_name,
+                         key,
+                         executor_id
+                         ])
+                return c.rowcount
         if self._run(_helper) != 1:
             raise Exception("Setting value to unannouced config: {}/{}".format(collection_name, entry.config))
 
@@ -147,39 +170,40 @@ class DB:
             SELECT collection, key FROM selected
         """.format(self.RECURSIVE_CONSUMERS)
         def _helper():
-            c = self.conn.cursor()
-            rs = c.execute(query, [collection_name, key])
-            return [(r[0], r[1]) for r in rs]
+            with transaction(self.conn) as c:
+                rs = c.execute(query, [collection_name, key])
+                return [(r[0], r[1]) for r in rs]
         return self._run(_helper)
 
     def has_entry_by_key(self, collection_name, key):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("SELECT COUNT(*) FROM entries WHERE collection = ? AND key = ? AND value is not null",
-                      [collection_name, key])
-            return bool(c.fetchone()[0])
+            with transaction(self.conn) as c:
+                c.execute("SELECT COUNT(*) FROM entries WHERE collection = ? AND key = ? AND value is not null",
+                        [collection_name, key])
+                return bool(c.fetchone()[0])
         return self._run(_helper)
 
     def get_entry_state(self, collection_name, key):
+        print("Get entry state {}/{}".format(collection_name, key))
         def _helper():
-            c = self.conn.cursor()
-            c.execute("SELECT value is not null FROM entries WHERE collection = ? AND key = ? AND (value is not null OR executor is null OR executor in (SELECT id FROM executors WHERE {}))".format(self.LIVE_EXECUTOR_QUERY),
-                      [collection_name, key])
-            v = c.fetchone()
-            if v is None:
-                return None
-            if v[0]:
-                return "finished"
-            else:
-                return "announced"
+            with transaction(self.conn) as c:
+                c.execute("SELECT value is not null FROM entries WHERE collection = ? AND key = ? AND (value is not null OR executor is null OR executor in (SELECT id FROM executors WHERE {}))".format(self.LIVE_EXECUTOR_QUERY),
+                        [collection_name, key])
+                v = c.fetchone()
+                if v is None:
+                    return None
+                if v[0]:
+                    return "finished"
+                else:
+                    return "announced"
         return self._run(_helper)
 
     def get_entry_no_config(self, collection_name, key):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("SELECT value, created FROM entries WHERE collection = ? AND key = ? AND (value is not null OR executor is null OR executor in (SELECT id FROM executors WHERE {}))".format(self.LIVE_EXECUTOR_QUERY),
-                    [collection_name, key])
-            return c.fetchone()
+            with transaction(self.conn) as c:
+                c.execute("SELECT value, created FROM entries WHERE collection = ? AND key = ? AND (value is not null OR executor is null OR executor in (SELECT id FROM executors WHERE {}))".format(self.LIVE_EXECUTOR_QUERY),
+                        [collection_name, key])
+                return c.fetchone()
         result = self._run(_helper)
         if result is None:
             return None
@@ -187,10 +211,10 @@ class DB:
 
     def get_entry(self, collection_name, key):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("SELECT config, value, created FROM entries WHERE collection = ? AND key = ?",
-                    [collection_name, key])
-            return c.fetchone()
+            with transaction(self.conn) as c:
+                c.execute("SELECT config, value, created FROM entries WHERE collection = ? AND key = ?",
+                        [collection_name, key])
+                return c.fetchone()
         result = self._run(_helper)
         if result is None:
             return None
@@ -199,8 +223,9 @@ class DB:
 
     def remove_entry_by_key(self, collection_name, key):
         def _helper():
-            self.conn.execute("{} DELETE FROM entries WHERE rowid IN (SELECT entries.rowid FROM selected LEFT JOIN entries ON entries.collection == selected.collection AND entries.key == selected.key)".format(self.RECURSIVE_CONSUMERS),
-                [collection_name, key])
+            with transaction(self.conn) as c:
+                self.conn.execute("{} DELETE FROM entries WHERE rowid IN (SELECT entries.rowid FROM selected LEFT JOIN entries ON entries.collection == selected.collection AND entries.key == selected.key)".format(self.RECURSIVE_CONSUMERS),
+                    [collection_name, key])
         self._run(_helper)
 
     """
@@ -212,76 +237,75 @@ class DB:
 
     def collection_summaries(self):
         def _helper():
-            c = self.conn.cursor()
-            r = c.execute("SELECT collection, COUNT(key), TOTAL(length(value)), TOTAL(length(config)) FROM entries GROUP BY collection ORDER BY collection")
-            result = []
-            found = set()
-            for name, count, size_value, size_config in r.fetchall():
-                found.add(name)
-                result.append({"name": name, "count": count, "size": size_value + size_config})
+            with transaction(self.conn) as c:
+                r = c.execute("SELECT collection, COUNT(key), TOTAL(length(value)), TOTAL(length(config)) FROM entries GROUP BY collection ORDER BY collection")
+                result = []
+                found = set()
+                for name, count, size_value, size_config in r.fetchall():
+                    found.add(name)
+                    result.append({"name": name, "count": count, "size": size_value + size_config})
 
-            c.execute("SELECT name FROM collections")
-            for x in r.fetchall():
-                name = x[0]
-                if name in found:
-                    continue
-                result.append({"name": name, "count": 0, "size": 0})
+                c.execute("SELECT name FROM collections")
+                for x in r.fetchall():
+                    name = x[0]
+                    if name in found:
+                        continue
+                    result.append({"name": name, "count": 0, "size": 0})
 
-            result.sort(key=lambda x: x["name"])
-            return result
+                result.sort(key=lambda x: x["name"])
+                return result
         return self._run(_helper)
 
     def _cleanup_lost_entries(self, cursor):
-        cursor.execute("DELETE FROM entries WHERE value is null AND executor IN (SELECT id FROM executors WHERE {})".format(self.DEAD_EXECUTOR_QUERY))
+        with transaction(self.conn) as c:
+            cursor.execute("DELETE FROM entries WHERE value is null AND executor IN (SELECT id FROM executors WHERE {})".format(self.DEAD_EXECUTOR_QUERY))
 
     def announce_entries(self, executor_id, refs, deps):
+        print("Announce entries {}".format([r.collection.name for r in refs]))
         def _helper():
-            c = self.conn.cursor()
-            self._cleanup_lost_entries(c)
-            self.conn.commit()
-            try:
-                c.executemany("INSERT INTO entries(collection, key, config, executor) VALUES (?, ?, ?, ?)",
-                    [[r.collection.name,
-                      r.collection.make_key(r.config),
-                      pickle.dumps(r.config),
-                      executor_id] for r in refs])
-                c.executemany("INSERT INTO deps VALUES (?, ?, ?, ?)", [
-                    [r1.collection.name,
-                     r1.collection.make_key(r1.config),
-                     r2.collection.name,
-                     r2.collection.make_key(r2.config)
-                    ] for r1, r2 in deps
-                ])
-                self.conn.commit()
-                return True
-            except sqlite3.IntegrityError as e:
-                self.conn.rollback()
-                return False
+            with transaction(self.conn) as c:
+                self._cleanup_lost_entries(c)
+            with transaction(self.conn) as c:
+                try:
+                    c.executemany("INSERT INTO entries(collection, key, config, executor) VALUES (?, ?, ?, ?)",
+                        [[r.collection.name,
+                          r.collection.make_key(r.config),
+                          pickle.dumps(r.config),
+                          executor_id] for r in refs])
+                    c.executemany("INSERT INTO deps VALUES (?, ?, ?, ?)", [
+                        [r1.collection.name,
+                         r1.collection.make_key(r1.config),
+                         r2.collection.name,
+                         r2.collection.make_key(r2.config)
+                        ] for r1, r2 in deps
+                    ])
+                    return True
+                except sqlite3.IntegrityError as e:
+                    return False
         return self._run(_helper)
 
     def entry_summaries(self, collection_name):
         def _helper():
-            c = self.conn.cursor()
-            r = c.execute("SELECT key, config, length(value), value_repr, created FROM entries WHERE collection = ?", [collection_name])
-            return [
-                {"key": key, "config": pickle.loads(config), "size": value_size + len(config) if value_size else len(config), "value_repr": value_repr, "created": created}
-                for key, config, value_size, value_repr, created in r.fetchall()
-            ]
+            with transaction(self.conn) as c:
+                r = c.execute("SELECT key, config, length(value), value_repr, created FROM entries WHERE collection = ?", [collection_name])
+                return [
+                    {"key": key, "config": pickle.loads(config), "size": value_size + len(config) if value_size else len(config), "value_repr": value_repr, "created": created}
+                    for key, config, value_size, value_repr, created in r.fetchall()
+                ]
         return self._run(_helper)
 
     def register_executor(self, executor):
         assert executor.id is None
         def _helper():
-            c = self.conn.cursor()
-            c.execute("INSERT INTO executors(created, heartbeat, heartbeat_interval, stats, type, version, resources) VALUES (?, DATETIME('now'), ?, ?, ?, ?, ?)",
-                    [executor.created,
-                     executor.heartbeat_interval,
-                     json.dumps(executor.get_stats()),
-                     executor.executor_type,
-                     executor.version,
-                     executor.resources])
-            self.conn.commit()
-            executor.id = c.lastrowid
+            with transaction(self.conn) as c:
+                c.execute("INSERT INTO executors(created, heartbeat, heartbeat_interval, stats, type, version, resources) VALUES (?, DATETIME('now'), ?, ?, ?, ?, ?)",
+                        [executor.created,
+                         executor.heartbeat_interval,
+                         json.dumps(executor.get_stats()),
+                         executor.executor_type,
+                         executor.version,
+                         executor.resources])
+                executor.id = c.lastrowid
         self._run(_helper)
 
     def executor_summaries(self):
@@ -294,34 +318,32 @@ class DB:
                 return "lost"
 
         def _helper():
-            c = self.conn.cursor()
-            r = c.execute("SELECT id, created, {}, stats, type, version, resources FROM executors".format(self.DEAD_EXECUTOR_QUERY))
-            #r = c.execute("SELECT uuid, created, , stats, type, version, resources FROM executors")
+            with transaction(self.conn) as c:
+                r = c.execute("SELECT id, created, {}, stats, type, version, resources FROM executors".format(self.DEAD_EXECUTOR_QUERY))
+                #r = c.execute("SELECT uuid, created, , stats, type, version, resources FROM executors")
 
-            return [
-                {"id": id,
-                 "created": created,
-                 "status": get_status(is_dead, stats),
-                 "stats": json.loads(stats) if stats else None,
-                 "type": executor_type,
-                 "version": version,
-                 "resources": resources,
-                } for id, created, is_dead, stats, executor_type, version, resources in r.fetchall()
-            ]
+                return [
+                    {"id": id,
+                     "created": created,
+                     "status": get_status(is_dead, stats),
+                     "stats": json.loads(stats) if stats else None,
+                     "type": executor_type,
+                     "version": version,
+                     "resources": resources,
+                    } for id, created, is_dead, stats, executor_type, version, resources in r.fetchall()
+                ]
         return self._run(_helper)
 
     def update_heartbeat(self, id):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("""UPDATE executors SET heartbeat = DATETIME('now') WHERE id = ? AND stats is not null""", [id])
-            self.conn.commit()
+            with transaction(self.conn) as c:
+                c.execute("""UPDATE executors SET heartbeat = DATETIME('now') WHERE id = ? AND stats is not null""", [id])
         self._run(_helper)
 
     def update_stats(self, id, stats):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("""UPDATE executors SET stats = ?, heartbeat = DATETIME('now') WHERE id = ?""", [json.dumps(stats), id])
-            self.conn.commit()
+            with transaction(self.conn) as c:
+                c.execute("""UPDATE executors SET stats = ?, heartbeat = DATETIME('now') WHERE id = ?""", [json.dumps(stats), id])
         self._run(_helper)
 
     def update_executor_stats(self, uuid, stats):
@@ -330,8 +352,7 @@ class DB:
 
     def stop_executor(self, id):
         def _helper():
-            c = self.conn.cursor()
-            c.execute("""UPDATE executors SET heartbeat = DATETIME('now'), stats = null WHERE id = ?""", [id])
-            c.execute("""DELETE FROM entries WHERE executor == ? AND value is null""", [id])
-            self.conn.commit()
+            with transaction(self.conn) as c:
+                c.execute("""UPDATE executors SET heartbeat = DATETIME('now'), stats = null WHERE id = ?""", [id])
+                c.execute("""DELETE FROM entries WHERE executor == ? AND value is null""", [id])
         self._run(_helper)
