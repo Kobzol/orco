@@ -1,7 +1,14 @@
-import collections
-
-
 class Entry:
+    """
+    A single computation with its configuration and result
+
+    Attributes
+    * config - configuration
+    * valu - resulting value of the computation
+    * created - datetime when entry was created
+    * comp_time - time of computation when entry was created, or None if entry was inserted
+    """
+
     __slots__ = ("config", "value", "created", "comp_time")
 
     def __init__(self, config, value, created=None, comp_time=None):
@@ -16,8 +23,3 @@ class Entry:
 
     def __repr__(self):
         return "<Entry {}>".format(self.config)
-
-
-# Value is serialized
-RawEntry = collections.namedtuple(
-    "RawEntry", ["collection_name", "key", "config", "value", "value_repr", "comp_time"])
